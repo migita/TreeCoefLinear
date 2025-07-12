@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tree_coef_linear import TreeCoefficientLinear
 from tree_coef_linear_v2 import TreeCoefficientLinearV2
+from vcboost import VCBoostRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.linear_model import LinearRegression, RidgeCV
@@ -17,8 +18,8 @@ def generate_synthetic_data(n_samples=1000, random_state=42):
     """
     np.random.seed(random_state)
     
-    # Feature variable - 1D for visualization
-    X = np.random.uniform(-3, 3, n_samples).reshape(-1, 1)
+    # Feature variable - 3D
+    X = np.random.uniform(-3, 3, (n_samples, 3))
     
     # Coefficient variables
     z1 = np.random.randn(n_samples)
@@ -26,14 +27,14 @@ def generate_synthetic_data(n_samples=1000, random_state=42):
     Z = np.column_stack([z1, z2])
     
     # True non-linear functions - designed to be hard for polynomials
-    # T1: High-frequency oscillation (sin with high frequency)
-    T1_X = np.sin(5 * X[:, 0]) * np.exp(-0.1 * np.abs(X[:, 0]))
+    # T1: High-frequency oscillation using multiple dimensions
+    T1_X = np.sin(5 * X[:, 0]) * np.exp(-0.1 * np.abs(X[:, 1])) * np.cos(2 * X[:, 2])
     
-    # T2: Step-like function (smooth approximation of step function)
-    T2_X = 0.5 * (np.tanh(10 * (X[:, 0] - 1)) + np.tanh(10 * (X[:, 0] + 1)))
+    # T2: Step-like function using interaction of dimensions
+    T2_X = 0.5 * (np.tanh(10 * (X[:, 0] + X[:, 1] - 1)) + np.tanh(10 * (X[:, 2] - X[:, 0] + 1)))
     
     # Generate target with higher noise
-    y = T1_X * z1 + T2_X * z2 + 0.5 * np.random.randn(n_samples)
+    y = T1_X * z1 + T2_X * z2 + 1.0 * np.random.randn(n_samples)
     
     return X, y, Z, T1_X, T2_X
 
@@ -62,9 +63,13 @@ def main():
     model_xgb = TreeCoefficientLinearV2(
         n_components=2,
         base_estimator='xgboost',
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=4,
+        n_estimators=300,
+        learning_rate=0.03,
+        max_depth=2,
+        reg_alpha=1.0,
+        reg_lambda=5.0,
+        subsample=0.7,
+        colsample_bytree=0.7,
         random_state=42
     )
     
@@ -85,9 +90,14 @@ def main():
     model_lgb = TreeCoefficientLinearV2(
         n_components=2,
         base_estimator='lightgbm',
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=4,
+        n_estimators=300,
+        learning_rate=0.03,
+        max_depth=2,
+        reg_alpha=1.0,
+        reg_lambda=5.0,
+        feature_fraction=0.7,
+        bagging_fraction=0.7,
+        bagging_freq=5,
         random_state=42
     )
     
@@ -101,12 +111,37 @@ def main():
     print(f"R² Score: {r2_lgb:.4f}")
     print()
     
+    # Example 3: Using VCBoost with vector-leaf trees
+    print("Example 3: VCBoost with vector-leaf trees")
+    print("-" * 40)
+    
+    model_vcb = VCBoostRegressor(
+        n_estimators=300,
+        learning_rate=0.03,
+        max_depth=2,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_lambda=5.0,
+        random_state=42
+    )
+    
+    model_vcb.fit(X_train, y_train, Z_train)
+    y_pred_vcb = model_vcb.predict(X_test, Z_test)
+    
+    mse_vcb = mean_squared_error(y_test, y_pred_vcb)
+    r2_vcb = r2_score(y_test, y_pred_vcb)
+    
+    print(f"MSE: {mse_vcb:.4f}")
+    print(f"R² Score: {r2_vcb:.4f}")
+    print()
+    
     # Compare learned functions with true functions
     print("Comparing learned vs true functions")
     print("-" * 40)
     
     # Get learned tree functions
     T_values = model_xgb.get_tree_functions(X_test)
+    T_values_vcb = model_vcb.predict_components(X_test)
     
     # For the test set, get the true T1 and T2 values
     # We need to get the true values for the actual test samples
@@ -117,24 +152,34 @@ def main():
     # Compute correlations
     corr_T1 = np.corrcoef(T_values[:, 0], true_T1_test)[0, 1]
     corr_T2 = np.corrcoef(T_values[:, 1], true_T2_test)[0, 1]
+    corr_T1_vcb = np.corrcoef(T_values_vcb[:, 0], true_T1_test)[0, 1]
+    corr_T2_vcb = np.corrcoef(T_values_vcb[:, 1], true_T2_test)[0, 1]
     
-    print(f"Correlation between learned T₁(X) and true T₁(X): {corr_T1:.4f}")
-    print(f"Correlation between learned T₂(X) and true T₂(X): {corr_T2:.4f}")
+    print(f"TreeCoef XGB - Correlation T₁: {corr_T1:.4f}, T₂: {corr_T2:.4f}")
+    print(f"VCBoost - Correlation T₁: {corr_T1_vcb:.4f}, T₂: {corr_T2_vcb:.4f}")
     print()
     
     # Add linear regression for comparison
     # Simple linear regression with X*Z interactions only
     X_Z_train_simple = np.column_stack([
-        X_train,  # X
+        X_train,  # X1, X2, X3
         Z_train,  # Z1, Z2
-        X_train * Z_train[:, 0:1],  # X*Z1
-        X_train * Z_train[:, 1:2]   # X*Z2
+        X_train[:, 0:1] * Z_train[:, 0:1],  # X1*Z1
+        X_train[:, 0:1] * Z_train[:, 1:2],  # X1*Z2
+        X_train[:, 1:2] * Z_train[:, 0:1],  # X2*Z1
+        X_train[:, 1:2] * Z_train[:, 1:2],  # X2*Z2
+        X_train[:, 2:3] * Z_train[:, 0:1],  # X3*Z1
+        X_train[:, 2:3] * Z_train[:, 1:2]   # X3*Z2
     ])
     X_Z_test_simple = np.column_stack([
-        X_test,  # X
+        X_test,  # X1, X2, X3
         Z_test,  # Z1, Z2
-        X_test * Z_test[:, 0:1],  # X*Z1
-        X_test * Z_test[:, 1:2]   # X*Z2
+        X_test[:, 0:1] * Z_test[:, 0:1],  # X1*Z1
+        X_test[:, 0:1] * Z_test[:, 1:2],  # X1*Z2
+        X_test[:, 1:2] * Z_test[:, 0:1],  # X2*Z1
+        X_test[:, 1:2] * Z_test[:, 1:2],  # X2*Z2
+        X_test[:, 2:3] * Z_test[:, 0:1],  # X3*Z1
+        X_test[:, 2:3] * Z_test[:, 1:2]   # X3*Z2
     ])
     linear_model_simple = LinearRegression()
     linear_model_simple.fit(X_Z_train_simple, y_train)
@@ -198,28 +243,28 @@ def main():
     # Visualization
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
-    # Sort data by X for smooth line plots
+    # Sort data by first dimension for visualization
     sort_idx = np.argsort(X_test[:, 0])
     X_test_sorted = X_test[sort_idx, 0]
     T_values_sorted = T_values[sort_idx]
     true_T1_test_sorted = true_T1_test[sort_idx]
     true_T2_test_sorted = true_T2_test[sort_idx]
     
-    # Plot 1: True vs Learned T1 function
-    axes[0, 0].plot(X_test_sorted, true_T1_test_sorted, 'b-', label='True T₁(x)', linewidth=2)
-    axes[0, 0].plot(X_test_sorted, T_values_sorted[:, 0], 'r--', label='Learned T₁(x)', linewidth=2)
-    axes[0, 0].set_xlabel('x')
-    axes[0, 0].set_ylabel('T₁(x)')
-    axes[0, 0].set_title(f'T₁: Damped Oscillation (ρ = {corr_T1:.3f})')
+    # Plot 1: True vs Learned T1 function (projected on x1)
+    axes[0, 0].scatter(X_test_sorted, true_T1_test_sorted, alpha=0.5, s=20, label='True T₁(X)', color='blue')
+    axes[0, 0].scatter(X_test_sorted, T_values_sorted[:, 0], alpha=0.5, s=20, label='Learned T₁(X)', color='red')
+    axes[0, 0].set_xlabel('x₁')
+    axes[0, 0].set_ylabel('T₁(X)')
+    axes[0, 0].set_title(f'T₁: Multi-dim Oscillation (ρ = {corr_T1:.3f})')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
-    # Plot 2: True vs Learned T2 function
-    axes[0, 1].plot(X_test_sorted, true_T2_test_sorted, 'b-', label='True T₂(x)', linewidth=2)
-    axes[0, 1].plot(X_test_sorted, T_values_sorted[:, 1], 'r--', label='Learned T₂(x)', linewidth=2)
-    axes[0, 1].set_xlabel('x')
-    axes[0, 1].set_ylabel('T₂(x)')
-    axes[0, 1].set_title(f'T₂: Double Step Function (ρ = {corr_T2:.3f})')
+    # Plot 2: True vs Learned T2 function (projected on x1)
+    axes[0, 1].scatter(X_test_sorted, true_T2_test_sorted, alpha=0.5, s=20, label='True T₂(X)', color='blue')
+    axes[0, 1].scatter(X_test_sorted, T_values_sorted[:, 1], alpha=0.5, s=20, label='Learned T₂(X)', color='red')
+    axes[0, 1].set_xlabel('x₁')
+    axes[0, 1].set_ylabel('T₂(X)')
+    axes[0, 1].set_title(f'T₂: Multi-dim Step Function (ρ = {corr_T2:.3f})')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
     
@@ -241,19 +286,20 @@ def main():
     ax5 = axes[1, 2]
     
     # Prepare data for bar chart
-    model_names = ['Linear\n(X*Z)', 'Poly\n(deg 7)', 'TreeCoef\n(XGB)', 'TreeCoef\n(LGB)']
-    r2_scores = [r2_linear_simple, r2_linear_poly, r2_xgb, r2_lgb]
-    colors = ['lightcoral', 'orange', 'blue', 'green']
+    model_names = ['Linear\n(X*Z)', 'Poly\n(deg 7)', 'TreeCoef\n(XGB)', 'TreeCoef\n(LGB)', 'VCBoost']
+    r2_scores = [r2_linear_simple, r2_linear_poly, r2_xgb, r2_lgb, r2_vcb]
+    colors = ['lightcoral', 'orange', 'blue', 'green', 'purple']
     
     # Create bar chart
     bars = ax5.bar(model_names, r2_scores, color=colors, alpha=0.7)
     
     # Add feature counts as text labels
     feature_counts = [
-        5,  # X, Z1, Z2, X*Z1, X*Z2
+        11,  # X1,X2,X3, Z1, Z2, X1*Z1, X1*Z2, X2*Z1, X2*Z2, X3*Z1, X3*Z2
         poly_results[7]['n_features'],
         2,  # TreeCoef learns 2 functions
-        2   # TreeCoef learns 2 functions
+        2,  # TreeCoef learns 2 functions
+        2   # VCBoost learns 2 functions
     ]
     
     for bar, r2, n_feat in zip(bars, r2_scores, feature_counts):
@@ -274,16 +320,20 @@ def main():
     print("Results visualization saved to 'tree_coefficient_linear_results.png'")
     plt.show()
     
-    # Example 3: Using more components
-    print("\nExample 3: Using more components than needed")
+    # Example 4: Using more components
+    print("\nExample 4: Using more components than needed")
     print("-" * 40)
     
     model_extra = TreeCoefficientLinearV2(
         n_components=4,  # Using 4 components when data has only 2
         base_estimator='xgboost',
-        n_estimators=50,
-        learning_rate=0.1,
-        max_depth=3,
+        n_estimators=300,
+        learning_rate=0.03,
+        max_depth=2,
+        reg_alpha=1.0,
+        reg_lambda=5.0,
+        subsample=0.7,
+        colsample_bytree=0.7,
         random_state=42
     )
     
@@ -325,12 +375,16 @@ def main():
     print(f"Ridge Polynomial (deg 7):      R² = {r2_linear_poly:.4f}, MSE = {mse_linear_poly:.4f}")
     print(f"TreeCoefficientLinear (XGB):   R² = {r2_xgb:.4f}, MSE = {mse_xgb:.4f}")
     print(f"TreeCoefficientLinear (LGB):   R² = {r2_lgb:.4f}, MSE = {mse_lgb:.4f}")
+    print(f"VCBoost (vector-leaf):         R² = {r2_vcb:.4f}, MSE = {mse_vcb:.4f}")
     
     improvement_xgb_poly = ((mse_linear_poly - mse_xgb) / mse_linear_poly) * 100
     improvement_lgb_poly = ((mse_linear_poly - mse_lgb) / mse_linear_poly) * 100
+    improvement_vcb_poly = ((mse_linear_poly - mse_vcb) / mse_linear_poly) * 100
     
-    print(f"\nMSE Improvement:")
-    print(f"TreeCoef vs Polynomial: XGB {improvement_xgb_poly:.1f}% better, LGB {improvement_lgb_poly:.1f}% better")
+    print(f"\nMSE Improvement vs Polynomial:")
+    print(f"TreeCoef XGB: {improvement_xgb_poly:.1f}% better")
+    print(f"TreeCoef LGB: {improvement_lgb_poly:.1f}% better") 
+    print(f"VCBoost: {improvement_vcb_poly:.1f}% better")
 
 
 if __name__ == "__main__":
